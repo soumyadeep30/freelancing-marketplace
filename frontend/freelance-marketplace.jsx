@@ -1,5 +1,45 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Search, X, Star, ArrowRight, Send, Check, ShieldCheck, Clock, Briefcase } from "lucide-react";
+import { Search, X, Star, ArrowRight, Send, Check, ShieldCheck, Clock, Briefcase, LogIn, LogOut, Loader2, AlertCircle } from "lucide-react";
+
+// Point this at wherever the Fieldwork API is running. See the backend's
+// README.md — `npm run dev` serves it on http://localhost:4000 by default.
+const API_BASE_URL = "http://localhost:4000/api";
+const TOKEN_KEY = "fieldwork_token";
+
+function getToken() {
+  return localStorage.getItem(TOKEN_KEY);
+}
+function setStoredToken(token) {
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+  else localStorage.removeItem(TOKEN_KEY);
+}
+
+// Thin fetch wrapper: attaches the JSON content type, optionally attaches
+// the bearer token, and normalizes the backend's { error: { message } }
+// shape into a thrown Error so callers can just try/catch.
+async function api(path, { method = "GET", body, auth = false } = {}) {
+  const headers = { "Content-Type": "application/json" };
+  if (auth) {
+    const token = getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+  }
+  let res;
+  try {
+    res = await fetch(`${API_BASE_URL}${path}`, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch (err) {
+    throw new Error("Can't reach the Fieldwork API. Is the backend running?");
+  }
+  if (res.status === 204) return null;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error?.message || "Something went wrong. Please try again.");
+  }
+  return data;
+}
 
 const CATEGORY_COLOR = {
   Design: "#B45309",
@@ -11,6 +51,8 @@ const CATEGORY_COLOR = {
 };
 const CATEGORIES = Object.keys(CATEGORY_COLOR);
 
+// Used as an instant-paint fallback while the real data loads from the API,
+// and as an offline fallback if the backend can't be reached.
 const INITIAL_GIGS = [
   {
     id: "g1",
@@ -113,6 +155,7 @@ const INITIAL_GIGS = [
   },
 ];
 
+// Same idea as INITIAL_GIGS: instant-paint + offline fallback.
 const FREELANCERS = [
   { id: "f1", name: "Mara Ilić", role: "Brand & identity designer", rate: "$75/hr", rating: 4.9, reviews: 128, skills: ["Logo", "Illustrator", "Branding"], available: true, color: "#B45309" },
   { id: "f2", name: "Ken Osei", role: "Full-stack developer", rate: "$95/hr", rating: 5.0, reviews: 94, skills: ["React", "Node", "Postgres"], available: true, color: "#1D4ED8" },
@@ -176,6 +219,9 @@ export default function FreelanceBoard() {
   const [category, setCategory] = useState("All");
   const [query, setQuery] = useState("");
   const [gigs, setGigs] = useState(INITIAL_GIGS);
+  const [gigsLoading, setGigsLoading] = useState(true);
+  const [gigsError, setGigsError] = useState("");
+  const [freelancers, setFreelancers] = useState(FREELANCERS);
   const [newIds, setNewIds] = useState([]);
   const [selectedGig, setSelectedGig] = useState(null);
   const [selectedFreelancer, setSelectedFreelancer] = useState(null);
@@ -184,7 +230,27 @@ export default function FreelanceBoard() {
   const [form, setForm] = useState({ title: "", category: "Design", budget: "", type: "Fixed price", desc: "" });
   const [formError, setFormError] = useState("");
   const [proposalSent, setProposalSent] = useState({});
+  const [proposalBusyId, setProposalBusyId] = useState(null);
   const toastTimer = useRef(null);
+
+  // --- Auth ---
+  const [user, setUser] = useState(null);
+  const [freelancerProfile, setFreelancerProfile] = useState(null);
+  const [authModal, setAuthModal] = useState(null); // null | "login" | "signup"
+  const [authForm, setAuthForm] = useState({ name: "", email: "", password: "", role: "client" });
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+
+  // --- "Create a freelancer profile" flow, triggered when a proposal needs one ---
+  const [showProfileForm, setShowProfileForm] = useState(false);
+  const [profileForm, setProfileForm] = useState({ role: "", rateAmount: "", skills: "" });
+  const [profileError, setProfileError] = useState("");
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [pendingProposalGigId, setPendingProposalGigId] = useState(null);
+
+  // --- Message-a-freelancer draft ---
+  const [messageDraft, setMessageDraft] = useState("");
+  const [messageBusy, setMessageBusy] = useState(false);
 
   useEffect(() => {
     return () => { if (toastTimer.current) clearTimeout(toastTimer.current); };
@@ -196,45 +262,192 @@ export default function FreelanceBoard() {
     toastTimer.current = setTimeout(() => setToast(""), 2600);
   }
 
-  const filteredGigs = gigs.filter((g) => {
-    const matchesCategory = category === "All" || g.category === category;
-    const q = query.trim().toLowerCase();
-    const matchesQuery =
-      !q ||
-      g.title.toLowerCase().includes(q) ||
-      g.tags.some((t) => t.toLowerCase().includes(q));
-    return matchesCategory && matchesQuery;
-  });
+  // Load the logged-in user (if any) once, on mount.
+  useEffect(() => {
+    if (!getToken()) return;
+    api("/auth/me", { auth: true })
+      .then(({ user, freelancerProfile }) => {
+        setUser(user);
+        setFreelancerProfile(freelancerProfile || null);
+      })
+      .catch(() => setStoredToken(null)); // stale/expired token
+  }, []);
 
-  function handlePostSubmit(e) {
+  // Load freelancers once, on mount.
+  useEffect(() => {
+    api("/freelancers?limit=100")
+      .then(({ data }) => setFreelancers(data))
+      .catch(() => {}); // keep the offline fallback list on failure
+  }, []);
+
+  // Load gigs from the API, refetching whenever the category or search
+  // query changes (debounced so we don't hit the API on every keystroke).
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setGigsLoading(true);
+      setGigsError("");
+      const params = new URLSearchParams({ limit: "100" });
+      if (category !== "All") params.set("category", category);
+      if (query.trim()) params.set("q", query.trim());
+
+      api(`/gigs?${params.toString()}`)
+        .then(({ data }) => setGigs(data))
+        .catch((err) => setGigsError(err.message))
+        .finally(() => setGigsLoading(false));
+    }, 250);
+    return () => clearTimeout(t);
+  }, [category, query]);
+
+  // filteredGigs is now just `gigs` — filtering happens server-side above.
+  // Kept as its own name so the JSX below (and the empty-state check) reads the same.
+  const filteredGigs = gigs;
+
+  async function handlePostSubmit(e) {
     e.preventDefault();
     if (!form.title.trim() || !form.budget.trim() || !form.desc.trim()) {
       setFormError("Fill in a title, budget, and description before posting.");
       return;
     }
-    const id = `g${Date.now()}`;
-    const newGig = {
-      id,
-      title: form.title.trim(),
-      category: form.category,
-      budget: form.type === "Hourly" ? `$${form.budget.replace(/[^0-9]/g, "")}/hr` : `$${form.budget.replace(/[^0-9]/g, "")}`,
-      type: form.type,
-      posted: "Just now",
-      remote: true,
-      desc: form.desc.trim(),
-      tags: [],
-    };
-    setGigs((g) => [newGig, ...g]);
-    setNewIds((ids) => [id, ...ids]);
-    setForm({ title: "", category: "Design", budget: "", type: "Fixed price", desc: "" });
-    setFormError("");
-    setShowPostForm(false);
-    fireToast("Job posted successfully.");
+    if (!user) {
+      setFormError("Log in to post a job.");
+      setShowPostForm(false);
+      setAuthModal("login");
+      return;
+    }
+    const amount = Number(form.budget.replace(/[^0-9.]/g, ""));
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setFormError("Budget should be a number, e.g. 1500 or 45.");
+      return;
+    }
+
+    try {
+      const { data: newGig } = await api("/gigs", {
+        method: "POST",
+        auth: true,
+        body: { title: form.title.trim(), category: form.category, budgetAmount: amount, type: form.type, desc: form.desc.trim(), tags: [] },
+      });
+      setGigs((g) => [newGig, ...g]);
+      setNewIds((ids) => [newGig.id, ...ids]);
+      setForm({ title: "", category: "Design", budget: "", type: "Fixed price", desc: "" });
+      setFormError("");
+      setShowPostForm(false);
+      fireToast("Job posted successfully.");
+    } catch (err) {
+      setFormError(err.message);
+    }
   }
 
-  function sendProposal(gigId) {
-    setProposalSent((p) => ({ ...p, [gigId]: true }));
-    fireToast("Proposal sent.");
+  async function sendProposal(gigId) {
+    if (!user) {
+      setAuthModal("login");
+      return;
+    }
+    setProposalBusyId(gigId);
+    try {
+      await api(`/gigs/${gigId}/proposals`, { method: "POST", auth: true, body: {} });
+      setProposalSent((p) => ({ ...p, [gigId]: true }));
+      fireToast("Proposal sent.");
+    } catch (err) {
+      if (err.message.toLowerCase().includes("freelancer profile")) {
+        setPendingProposalGigId(gigId);
+        setProfileError("");
+        setShowProfileForm(true);
+      } else {
+        fireToast(err.message);
+      }
+    } finally {
+      setProposalBusyId(null);
+    }
+  }
+
+  async function handleAuthSubmit(e) {
+    e.preventDefault();
+    setAuthError("");
+    if (!authForm.email.trim() || !authForm.password.trim() || (authModal === "signup" && !authForm.name.trim())) {
+      setAuthError("Fill in all fields to continue.");
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      const path = authModal === "signup" ? "/auth/register" : "/auth/login";
+      const body =
+        authModal === "signup"
+          ? { name: authForm.name.trim(), email: authForm.email.trim(), password: authForm.password, role: authForm.role }
+          : { email: authForm.email.trim(), password: authForm.password };
+      const { token, user: loggedInUser } = await api(path, { method: "POST", body });
+      setStoredToken(token);
+      setUser(loggedInUser);
+      setAuthModal(null);
+      setAuthForm({ name: "", email: "", password: "", role: "client" });
+      fireToast(authModal === "signup" ? `Welcome, ${loggedInUser.name.split(" ")[0]}.` : `Welcome back, ${loggedInUser.name.split(" ")[0]}.`);
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  function handleLogout() {
+    setStoredToken(null);
+    setUser(null);
+    setFreelancerProfile(null);
+    fireToast("Logged out.");
+  }
+
+  async function handleProfileSubmit(e) {
+    e.preventDefault();
+    setProfileError("");
+    if (!profileForm.role.trim() || !profileForm.rateAmount.trim()) {
+      setProfileError("Add a title and an hourly rate to continue.");
+      return;
+    }
+    const amount = Number(profileForm.rateAmount.replace(/[^0-9.]/g, ""));
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setProfileError("Rate should be a number, e.g. 65.");
+      return;
+    }
+    setProfileBusy(true);
+    try {
+      const skills = profileForm.skills.split(",").map((s) => s.trim()).filter(Boolean);
+      const { data: profile } = await api("/freelancers", {
+        method: "POST",
+        auth: true,
+        body: { role: profileForm.role.trim(), rateAmount: amount, skills, available: true },
+      });
+      setFreelancerProfile(profile);
+      setShowProfileForm(false);
+      setProfileForm({ role: "", rateAmount: "", skills: "" });
+      fireToast("Freelancer profile created.");
+
+      if (pendingProposalGigId) {
+        const gigId = pendingProposalGigId;
+        setPendingProposalGigId(null);
+        await sendProposal(gigId);
+      }
+    } catch (err) {
+      setProfileError(err.message);
+    } finally {
+      setProfileBusy(false);
+    }
+  }
+
+  async function handleSendMessage(freelancer) {
+    if (!user) {
+      setAuthModal("login");
+      return;
+    }
+    const body = messageDraft.trim() || `Hi ${freelancer.name.split(" ")[0]}, I'd like to talk about a project.`;
+    setMessageBusy(true);
+    try {
+      await api("/messages", { method: "POST", auth: true, body: { recipientId: freelancer.userId, body } });
+      fireToast(`Message sent to ${freelancer.name.split(" ")[0]}.`);
+      setMessageDraft("");
+      setSelectedFreelancer(null);
+    } catch (err) {
+      fireToast(err.message);
+    } finally {
+      setMessageBusy(false);
+    }
   }
 
   return (
@@ -278,6 +491,18 @@ export default function FreelanceBoard() {
           font-size: 14px; padding: 10px 18px; border-radius: 7px; transition: background 0.15s ease;
         }
         .nav-cta:hover { background: var(--accent-hover); }
+        .nav-user { font-size: 13.5px; font-weight: 600; color: var(--text-secondary); }
+        .btn-icon {
+          display: inline-flex; align-items: center; gap: 6px; background: transparent; border: 1px solid var(--border-strong);
+          color: var(--ink); font-weight: 600; font-size: 13.5px; padding: 8px 13px; border-radius: 7px; transition: background 0.15s ease;
+        }
+        .btn-icon:hover { background: var(--bg-subtle); }
+        .form-tabs { display: flex; gap: 6px; background: var(--bg-subtle); padding: 4px; border-radius: 8px; margin-bottom: 18px; }
+        .form-tab { flex: 1; background: transparent; border: none; padding: 8px; border-radius: 6px; font-weight: 600; font-size: 13.5px; color: var(--text-secondary); }
+        .form-tab.active { background: var(--bg); color: var(--ink); box-shadow: 0 1px 3px rgba(15,23,42,0.08); }
+        .error-state { display: flex; align-items: center; justify-content: center; gap: 6px; color: #B91C1C; }
+        .spin { animation: fw-spin 0.8s linear infinite; }
+        @keyframes fw-spin { to { transform: rotate(360deg); } }
 
         .hero {
           padding: 64px 32px 48px; text-align: center; background: var(--bg); border-bottom: 1px solid var(--border);
@@ -427,6 +652,16 @@ export default function FreelanceBoard() {
           <span>How it works</span>
         </div>
         <div className="nav-right">
+          {user ? (
+            <>
+              <span className="nav-user">Hi, {user.name.split(" ")[0]}</span>
+              <button className="btn-icon" onClick={handleLogout} aria-label="Log out"><LogOut size={15} /></button>
+            </>
+          ) : (
+            <button className="btn-icon" onClick={() => { setAuthModal("login"); setAuthError(""); }}>
+              <LogIn size={14} /> Log in
+            </button>
+          )}
           <button className="nav-cta" onClick={() => setShowPostForm(true)}>Post a job</button>
         </div>
       </nav>
@@ -443,7 +678,7 @@ export default function FreelanceBoard() {
 
       <div className="stats">
         <div className="stat"><div className="stat-num">{gigs.length}</div><div className="stat-label">Open jobs</div></div>
-        <div className="stat"><div className="stat-num">{FREELANCERS.length}</div><div className="stat-label">Freelancers available</div></div>
+        <div className="stat"><div className="stat-num">{freelancers.length}</div><div className="stat-label">Freelancers available</div></div>
         <div className="stat"><div className="stat-num">6</div><div className="stat-label">Categories</div></div>
         <div className="stat"><div className="stat-num">24h</div><div className="stat-label">Avg. first reply</div></div>
       </div>
@@ -480,7 +715,11 @@ export default function FreelanceBoard() {
           </div>
         </div>
 
-        {filteredGigs.length === 0 ? (
+        {gigsError ? (
+          <div className="empty-state error-state"><AlertCircle size={15} /> {gigsError}</div>
+        ) : gigsLoading && filteredGigs.length === 0 ? (
+          <div className="empty-state"><Loader2 size={15} className="spin" /> Loading jobs…</div>
+        ) : filteredGigs.length === 0 ? (
           <div className="empty-state">No jobs match that search. Try another skill or clear the filter.</div>
         ) : (
           <div className="board-grid">
@@ -499,7 +738,7 @@ export default function FreelanceBoard() {
           </div>
         </div>
         <div className="freelancer-row">
-          {FREELANCERS.map((f) => <FreelancerCard key={f.id} f={f} onOpen={setSelectedFreelancer} />)}
+          {freelancers.map((f) => <FreelancerCard key={f.id} f={f} onOpen={setSelectedFreelancer} />)}
         </div>
       </section>
 
@@ -557,18 +796,24 @@ export default function FreelanceBoard() {
             <button
               className={`btn-submit ${proposalSent[selectedGig.id] ? "sent-btn" : ""}`}
               onClick={() => sendProposal(selectedGig.id)}
-              disabled={!!proposalSent[selectedGig.id]}
+              disabled={!!proposalSent[selectedGig.id] || proposalBusyId === selectedGig.id}
             >
-              {proposalSent[selectedGig.id] ? <>Proposal sent <Check size={16} /></> : <>Send proposal <Send size={15} /></>}
+              {proposalSent[selectedGig.id] ? (
+                <>Proposal sent <Check size={16} /></>
+              ) : proposalBusyId === selectedGig.id ? (
+                <>Sending… <Loader2 size={15} className="spin" /></>
+              ) : (
+                <>Send proposal <Send size={15} /></>
+              )}
             </button>
           </div>
         </div>
       )}
 
       {selectedFreelancer && (
-        <div className="overlay" onClick={() => setSelectedFreelancer(null)}>
+        <div className="overlay" onClick={() => { setSelectedFreelancer(null); setMessageDraft(""); }}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <button className="modal-close" onClick={() => setSelectedFreelancer(null)} aria-label="Close"><X size={16} /></button>
+            <button className="modal-close" onClick={() => { setSelectedFreelancer(null); setMessageDraft(""); }} aria-label="Close"><X size={16} /></button>
             <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 18, marginTop: 4 }}>
               <div className="avatar" style={{ background: selectedFreelancer.color, width: 52, height: 52, fontSize: 18 }}>{initials(selectedFreelancer.name)}</div>
               <div>
@@ -585,9 +830,79 @@ export default function FreelanceBoard() {
             <div className="gig-tags" style={{ marginBottom: 22 }}>
               {selectedFreelancer.skills.map((s) => <span className="chip" key={s}>{s}</span>)}
             </div>
-            <button className="btn-submit" onClick={() => { fireToast(`Message sent to ${selectedFreelancer.name.split(" ")[0]}.`); setSelectedFreelancer(null); }}>
-              Message {selectedFreelancer.name.split(" ")[0]} <Send size={15} />
+            <label htmlFor="message-draft">Message</label>
+            <textarea
+              id="message-draft"
+              placeholder={`Hi ${selectedFreelancer.name.split(" ")[0]}, I'd like to talk about a project.`}
+              value={messageDraft}
+              onChange={(e) => setMessageDraft(e.target.value)}
+              style={{ marginBottom: 14 }}
+            />
+            <button className="btn-submit" onClick={() => handleSendMessage(selectedFreelancer)} disabled={messageBusy}>
+              {messageBusy ? <>Sending… <Loader2 size={15} className="spin" /></> : <>Message {selectedFreelancer.name.split(" ")[0]} <Send size={15} /></>}
             </button>
+          </div>
+        </div>
+      )}
+
+      {authModal && (
+        <div className="overlay" onClick={() => setAuthModal(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <button className="modal-close" onClick={() => setAuthModal(null)} aria-label="Close"><X size={16} /></button>
+            <span className="badge" style={{ color: "#B45309", background: "#FEF3E2" }}>{authModal === "signup" ? "Create account" : "Welcome back"}</span>
+            <h2>{authModal === "signup" ? "Sign up" : "Log in"}</h2>
+            <div className="form-tabs">
+              <button type="button" className={`form-tab ${authModal === "login" ? "active" : ""}`} onClick={() => { setAuthModal("login"); setAuthError(""); }}>Log in</button>
+              <button type="button" className={`form-tab ${authModal === "signup" ? "active" : ""}`} onClick={() => { setAuthModal("signup"); setAuthError(""); }}>Sign up</button>
+            </div>
+            <form className="modal-form" onSubmit={handleAuthSubmit}>
+              {authModal === "signup" && (
+                <>
+                  <label htmlFor="auth-name">Name</label>
+                  <input id="auth-name" type="text" placeholder="Your name" value={authForm.name} onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })} />
+                </>
+              )}
+              <label htmlFor="auth-email">Email</label>
+              <input id="auth-email" type="email" placeholder="you@example.com" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} />
+              <label htmlFor="auth-password">Password</label>
+              <input id="auth-password" type="password" placeholder={authModal === "signup" ? "At least 8 characters" : "Your password"} value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} />
+              {authModal === "signup" && (
+                <>
+                  <label htmlFor="auth-role">I'm mainly here to</label>
+                  <select id="auth-role" value={authForm.role} onChange={(e) => setAuthForm({ ...authForm, role: e.target.value })}>
+                    <option value="client">Post jobs</option>
+                    <option value="freelancer">Find work</option>
+                  </select>
+                </>
+              )}
+              {authError && <div className="form-error">{authError}</div>}
+              <button type="submit" className="btn-submit" disabled={authBusy}>
+                {authBusy ? <>Please wait… <Loader2 size={15} className="spin" /></> : <>{authModal === "signup" ? "Create account" : "Log in"} <ArrowRight size={16} /></>}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showProfileForm && (
+        <div className="overlay" onClick={() => { setShowProfileForm(false); setPendingProposalGigId(null); }}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <button className="modal-close" onClick={() => { setShowProfileForm(false); setPendingProposalGigId(null); }} aria-label="Close"><X size={16} /></button>
+            <span className="badge" style={{ color: "#B45309", background: "#FEF3E2" }}>One quick step</span>
+            <h2>Set up your freelancer profile</h2>
+            <p className="modal-desc">Clients see this when you send a proposal. You can edit it any time.</p>
+            <form className="modal-form" onSubmit={handleProfileSubmit}>
+              <label htmlFor="profile-role">Title</label>
+              <input id="profile-role" type="text" placeholder="e.g. Full-stack developer" value={profileForm.role} onChange={(e) => setProfileForm({ ...profileForm, role: e.target.value })} />
+              <label htmlFor="profile-rate">Hourly rate</label>
+              <input id="profile-rate" type="text" placeholder="e.g. 65" value={profileForm.rateAmount} onChange={(e) => setProfileForm({ ...profileForm, rateAmount: e.target.value })} />
+              <label htmlFor="profile-skills">Skills (comma separated)</label>
+              <input id="profile-skills" type="text" placeholder="e.g. React, Node, Postgres" value={profileForm.skills} onChange={(e) => setProfileForm({ ...profileForm, skills: e.target.value })} />
+              {profileError && <div className="form-error">{profileError}</div>}
+              <button type="submit" className="btn-submit" disabled={profileBusy}>
+                {profileBusy ? <>Saving… <Loader2 size={15} className="spin" /></> : <>Save profile <ArrowRight size={16} /></>}
+              </button>
+            </form>
           </div>
         </div>
       )}
