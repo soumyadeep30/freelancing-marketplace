@@ -3,7 +3,7 @@ import { Search, X, Star, ArrowRight, Send, Check, ShieldCheck, Clock, Briefcase
 
 // Point this at wherever the Fieldwork API is running. See the backend's
 // README.md — `npm run dev` serves it on http://localhost:4000 by default.
-const API_BASE_URL = "http://localhost:4000/api";
+const API_BASE_URL = "/api";
 const TOKEN_KEY = "fieldwork_token";
 
 function getToken() {
