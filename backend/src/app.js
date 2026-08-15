@@ -11,6 +11,9 @@ const freelancersRoutes = require("./routes/freelancers.routes");
 const proposalsRoutes = require("./routes/proposals.routes");
 const messagesRoutes = require("./routes/messages.routes");
 const categoriesRoutes = require("./routes/categories.routes");
+
+
+const app = express();
 const frontendPath = path.join(__dirname, "../../frontend/dist");
 
 app.use(express.static(frontendPath));
@@ -18,8 +21,6 @@ app.use(express.static(frontendPath));
 app.get("*", (req, res) => {
   res.sendFile(path.join(frontendPath, "index.html"));
 });
-
-const app = express();
 
 app.use(cors({ origin: config.corsOrigin }));
 app.use(express.json({ limit: "1mb" }));
